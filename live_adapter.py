@@ -1,127 +1,163 @@
-import json, math
+
+import json
+import math
+import statistics
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import joblib
 import pandas as pd
 
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+MODEL_FILE = "sensor_tool_condition_model.pkl"
+HOST = "0.0.0.0"
+PORT = 8765
 
-MODEL_FILE = 'sensor_tool_condition_model.pkl'
-HOST, PORT = '0.0.0.0', 8765
-
-FEATURES = [
- 'F_f_RMS','F_f_MEAN','F_f_MAX','F_c_RMS','F_c_MEAN','F_c_MAX',
- 'F_p_RMS','F_p_MEAN','F_p_MAX','CV3.Z_MEAN','CV3.Z_RMS',
- 'TV2.Z_MEAN','TV2.Z_RMS','AE_RMS','AE_C_0.1','CON.G.FREAL','CON.A.SREAL.S'
+MODEL_FEATURES = [
+    "F_f_RMS","F_f_MEAN","F_f_MAX",
+    "F_c_RMS","F_c_MEAN","F_c_MAX",
+    "F_p_RMS","F_p_MEAN","F_p_MAX",
+    "CV3.Z_MEAN","CV3.Z_RMS",
+    "TV2.Z_MEAN","TV2.Z_RMS",
+    "AE_RMS","AE_C_0.1",
+    "CON.G.FREAL","CON.A.SREAL.S",
 ]
 
-# Feature ranges observed in the experimental training dataset.
-TRAIN_RANGES = {
- 'F_f': (274.75, 2044.93), 'F_c': (480.58, 1058.27), 'F_p': (101.89, 905.89),
- 'CV3Z': (9.796, 29.664), 'TV2Z': (-106.856, 200.868),
- 'AE_RMS': (0.003175, 0.152073), 'AE_C01': (0.0, 173293.0),
- 'FEED': (0.0, 84091.87798), 'SPEED': (6906771.019, 12371794.46)
-}
+model = joblib.load(MODEL_FILE)
 
-def stats(vals):
-    vals = [float(v) for v in vals]
-    if not vals: return 0.0, 0.0, 0.0
-    mean = sum(vals)/len(vals)
-    rms = math.sqrt(sum(v*v for v in vals)/len(vals))
-    peak = max(abs(v) for v in vals)
+def stats(values):
+    if not values:
+        return 0.0, 0.0, 0.0
+    vals = [float(x) for x in values]
+    mean = sum(vals) / len(vals)
+    rms = math.sqrt(sum(x*x for x in vals) / len(vals))
+    peak = max(abs(x) for x in vals)
     return mean, rms, peak
 
-def scale(v, src_lo, src_hi, dst_lo, dst_hi):
-    if src_hi == src_lo: return (dst_lo+dst_hi)/2
-    x = (float(v)-src_lo)/(src_hi-src_lo)
-    x = max(0.0, min(1.0, x))
-    return dst_lo + x*(dst_hi-dst_lo)
+def condition(wear):
+    if wear < 0.15:
+        return "HEALTHY"
+    if wear < 0.20:
+        return "MONITOR"
+    if wear < 0.25:
+        return "WARNING"
+    return "TOOL CHANGE"
 
-def condition(w):
-    if w < 0.15: return 'HEALTHY'
-    if w < 0.20: return 'MONITOR'
-    if w < 0.25: return 'WARNING'
-    return 'TOOL CHANGE'
+def from_features(d):
+    # Native simulator WindowFeatures -> model features.
+    fc_mean = float(d.get("force_Fc_mean", 0))
+    fc_rms = float(d.get("force_Fc_rms", 0))
+    fc_peak = float(d.get("force_Fc_peak", 0))
 
-def build_features(payload):
-    frames = payload.get('frames', [])
-    if not frames:
-        raise ValueError('No simulator frames received')
+    # Simulator's current WindowFeatures currently contains Fc, not Ff/Fp.
+    # These are explicit proxies for the existing model interface.
+    ff_mean = float(d.get("force_Ff_mean", fc_mean))
+    ff_rms = float(d.get("force_Ff_rms", fc_rms))
+    ff_peak = float(d.get("force_Ff_peak", fc_peak))
+    fp_mean = float(d.get("force_Fp_mean", fc_mean))
+    fp_rms = float(d.get("force_Fp_rms", fc_rms))
+    fp_peak = float(d.get("force_Fp_peak", fc_peak))
 
-    fc = [f.get('force_Fc_N',0) for f in frames]
-    ff = [f.get('force_Ff_N',0) for f in frames]
-    fp = [f.get('force_Fp_N',0) for f in frames]
-    vz = [f.get('vibration_Z_g',0) for f in frames]
-    ae = [f.get('acousticEmission_RMS_V',0) for f in frames]
+    vib_mean = float(d.get("vib_z_mean", 0))
+    vib_rms = float(d.get("vib_z_rms", 0))
+    ae_rms = float(d.get("ae_rms", 0))
 
-    ff_m, ff_r, ff_p = stats(ff)
-    fc_m, fc_r, fc_p = stats(fc)
-    fp_m, fp_r, fp_p = stats(fp)
-    vz_m, vz_r, _ = stats(vz)
-    ae_m, ae_r, ae_p = stats(ae)
-
-    p = payload.get('params', {})
-    feed = float(p.get('feed_mm_per_rev', 0.25))
-    speed = float(p.get('cuttingSpeed_m_per_min', 180.0))
-    dia = float(p.get('workpieceDiameter_mm', 50.0))
-    rpm = speed*1000/(math.pi*dia) if dia > 0 else 0
-
-    # Calibrate simulator-native physical signals into the numerical feature
-    # space used by the existing experimental ML model. This does NOT retrain
-    # the model and does not add simulated wear to the prediction.
-    # Source envelopes are deliberately based on the simulator's control/signal
-    # ranges, while destination envelopes come from the training dataset.
-    Ff = [scale(x, 300, 2200, *TRAIN_RANGES['F_f']) for x in (ff_m, ff_r, ff_p)]
-    Fc = [scale(x, 500, 3000, *TRAIN_RANGES['F_c']) for x in (fc_m, fc_r, fc_p)]
-    Fp = [scale(x, 0, 100, *TRAIN_RANGES['F_p']) for x in (fp_m, fp_r, fp_p)]
-    VZ_m = scale(vz_m, 0.0, 1.0, *TRAIN_RANGES['CV3Z'])
-    VZ_r = scale(vz_r, 0.0, 1.0, *TRAIN_RANGES['CV3Z'])
-    TVZ_m = scale(vz_m, 0.0, 1.0, *TRAIN_RANGES['TV2Z'])
-    TVZ_r = scale(vz_r, 0.0, 1.0, *TRAIN_RANGES['TV2Z'])
-    AEr = scale(ae_r, 0.0, 2.0, *TRAIN_RANGES['AE_RMS'])
-    AEc = scale(ae_p, 0.0, 2.0, *TRAIN_RANGES['AE_C01'])
-    Feed = scale(feed, 0.10, 0.50, *TRAIN_RANGES['FEED'])
-    Speed = scale(speed, 80, 350, *TRAIN_RANGES['SPEED'])
+    feed = float(d.get("feed_mm_per_rev", 0))
+    speed = float(d.get("cuttingSpeed_m_per_min", 0))
+    diameter = float(d.get("workpieceDiameter_mm", 50))
+    rpm = speed * 1000.0 / (math.pi * diameter) if diameter > 0 else 0
 
     return {
-      'F_f_RMS':Ff[1], 'F_f_MEAN':Ff[0], 'F_f_MAX':Ff[2],
-      'F_c_RMS':Fc[1], 'F_c_MEAN':Fc[0], 'F_c_MAX':Fc[2],
-      'F_p_RMS':Fp[1], 'F_p_MEAN':Fp[0], 'F_p_MAX':Fp[2],
-      'CV3.Z_MEAN':VZ_m, 'CV3.Z_RMS':VZ_r,
-      'TV2.Z_MEAN':TVZ_m, 'TV2.Z_RMS':TVZ_r,
-      'AE_RMS':AEr, 'AE_C_0.1':AEc,
-      'CON.G.FREAL':Feed, 'CON.A.SREAL.S':Speed,
+        "F_f_RMS": ff_rms, "F_f_MEAN": ff_mean, "F_f_MAX": ff_peak,
+        "F_c_RMS": fc_rms, "F_c_MEAN": fc_mean, "F_c_MAX": fc_peak,
+        "F_p_RMS": fp_rms, "F_p_MEAN": fp_mean, "F_p_MAX": fp_peak,
+        "CV3.Z_MEAN": vib_mean, "CV3.Z_RMS": vib_rms,
+        "TV2.Z_MEAN": vib_mean, "TV2.Z_RMS": vib_rms,
+        "AE_RMS": ae_rms, "AE_C_0.1": ae_rms,
+        "CON.G.FREAL": feed, "CON.A.SREAL.S": rpm,
     }
 
-model = joblib.load(MODEL_FILE)
+def from_raw(frames, params=None):
+    fc = [f.get("force_Fc_N", 0) for f in frames]
+    ff = [f.get("force_Ff_N", 0) for f in frames]
+    fp = [f.get("force_Fp_N", 0) for f in frames]
+    vib = [f.get("vibration_Z_g", 0) for f in frames]
+    ae = [f.get("acousticEmission_RMS_V", 0) for f in frames]
+
+    ff_mean, ff_rms, ff_peak = stats(ff)
+    fc_mean, fc_rms, fc_peak = stats(fc)
+    fp_mean, fp_rms, fp_peak = stats(fp)
+    vib_mean, vib_rms, _ = stats(vib)
+    ae_mean, ae_rms, _ = stats(ae)
+
+    params = params or {}
+    feed = float(params.get("feed_mm_per_rev", 0))
+    speed = float(params.get("cuttingSpeed_m_per_min", 0))
+    diameter = float(params.get("workpieceDiameter_mm", 50))
+    rpm = speed * 1000.0 / (math.pi * diameter) if diameter > 0 else 0
+
+    return {
+        "F_f_RMS": ff_rms, "F_f_MEAN": ff_mean, "F_f_MAX": ff_peak,
+        "F_c_RMS": fc_rms, "F_c_MEAN": fc_mean, "F_c_MAX": fc_peak,
+        "F_p_RMS": fp_rms, "F_p_MEAN": fp_mean, "F_p_MAX": fp_peak,
+        "CV3.Z_MEAN": vib_mean, "CV3.Z_RMS": vib_rms,
+        "TV2.Z_MEAN": vib_mean, "TV2.Z_RMS": vib_rms,
+        "AE_RMS": ae_rms, "AE_C_0.1": ae_rms,
+        "CON.G.FREAL": feed, "CON.A.SREAL.S": rpm,
+    }
+
+def predict(payload):
+    if "frames" in payload:
+        features = from_raw(payload["frames"], payload.get("params"))
+    else:
+        features = from_features(payload)
+
+    X = pd.DataFrame([[features[c] for c in MODEL_FEATURES]], columns=MODEL_FEATURES)
+    wear = max(0.0, float(model.predict(X)[0]))
+
+    return {
+        "predicted_wear_mm": round(wear, 6),
+        "condition": condition(wear),
+        "simulation_time_sec": payload.get("simulation_time_sec"),
+        "features": features
+    }
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, code, obj):
         body = json.dumps(obj).encode()
         self.send_response(code)
-        self.send_header('Content-Type','application/json')
-        self.send_header('Access-Control-Allow-Origin','*')
-        self.send_header('Access-Control-Allow-Headers','Content-Type')
-        self.send_header('Access-Control-Allow-Methods','GET,POST,OPTIONS')
-        self.end_headers(); self.wfile.write(body)
-    def do_OPTIONS(self): self.send_json(200, {'status':'ok'})
-    def do_GET(self):
-        self.send_json(200, {'status':'running','model':MODEL_FILE}) if self.path=='/health' else self.send_json(404, {'error':'not found'})
-    def do_POST(self):
-        if self.path != '/predict': return self.send_json(404, {'error':'Use POST /predict'})
-        try:
-            n=int(self.headers.get('Content-Length',0)); payload=json.loads(self.rfile.read(n))
-            features=build_features(payload)
-            X=pd.DataFrame([[features[c] for c in FEATURES]], columns=FEATURES)
-            wear=max(0.0,float(model.predict(X)[0]))
-            self.send_json(200, {'predicted_wear_mm':round(wear,6),'condition':condition(wear), 'simulation_time_sec':payload.get('simulation_time_sec')})
-        except Exception as e:
-            self.send_json(500, {'error':str(e)})
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS, GET")
+        self.end_headers()
+        self.wfile.write(body)
 
-if __name__=='__main__':
-    print('='*60); print('AI LATHE TOOL WEAR - LIVE ML ADAPTER'); print('='*60)
-    print('Model :',MODEL_FILE); print('Host  :',HOST); print('Port  :',PORT)
-    print('Prediction endpoint: http://localhost:8765/predict')
-    print('Health check:       http://localhost:8765/health')
-    print('Waiting for simulator data...'); print('='*60)
-    HTTPServer((HOST,PORT),Handler).serve_forever()
+    def do_OPTIONS(self):
+        self.send_json(200, {"status": "ok"})
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_json(200, {"status": "running", "model": MODEL_FILE})
+        else:
+            self.send_json(404, {"error": "Not found"})
+
+    def do_POST(self):
+        if self.path != "/predict":
+            self.send_json(404, {"error": "Use POST /predict"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(n).decode())
+            self.send_json(200, predict(payload))
+        except Exception as e:
+            self.send_json(500, {"error": str(e)})
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("AI LATHE TOOL WEAR - LIVE ML ADAPTER")
+    print("=" * 60)
+    print(f"Model : {MODEL_FILE}")
+    print(f"Port  : {PORT}")
+    print("POST  : http://localhost:8765/predict")
+    print("GET   : http://localhost:8765/health")
+    print("Waiting for simulator data...")
+    print("=" * 60)
+    HTTPServer((HOST, PORT), Handler).serve_forever()

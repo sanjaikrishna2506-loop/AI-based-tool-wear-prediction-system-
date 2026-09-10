@@ -1,0 +1,6 @@
+{
+  "name": "CNC Lathe Tool-Wear Physics & ML Simulator",
+  "description": "A physics-informed CNC lathe turning simulation and ML training data generation engine with cited material models, Oxley/Merchant cutting mechanics, thermal partitioning, Usui wear kinetics, realistic multi-channel sensor synthesis, and ML pipeline export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
